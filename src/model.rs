@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Instant};
+use std::path::PathBuf;
 
 use ratatui::{layout::Rect, text::Line};
 use ratatui_image::thread::ThreadProtocol;
@@ -122,11 +122,51 @@ pub struct ImageRenderState {
 }
 
 #[derive(Clone, Debug)]
-pub struct LastClick(pub u16, pub u16, pub Instant);
-
-#[derive(Clone, Debug)]
 pub struct GrepResult {
     pub path: PathBuf,
     pub line_number: u64,
     pub line_content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextAction {
+    Open,
+    OpenEditor,
+    Rename,
+    Copy,
+    Move,
+    Delete,
+    NewFile,
+    NewDir,
+    ToggleHidden,
+    SortMode,
+    CopyPath,
+}
+
+impl ContextAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::OpenEditor => "Open in editor",
+            Self::Rename => "Rename",
+            Self::Copy => "Copy",
+            Self::Move => "Move",
+            Self::Delete => "Delete",
+            Self::NewFile => "New file",
+            Self::NewDir => "New directory",
+            Self::ToggleHidden => "Toggle hidden",
+            Self::SortMode => "Cycle sort",
+            Self::CopyPath => "Copy path",
+        }
+    }
+
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    pub actions: Vec<ContextAction>,
+    pub selected: usize,
+    pub x: u16,
+    pub y: u16,
+    pub target_path: Option<PathBuf>,
 }

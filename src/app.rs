@@ -26,8 +26,8 @@ use ratatui_image::{
 use crate::{
     fs_ops::{copy_path, read_entries, resolve_destination, sort_entries},
     model::{
-        CommandMode, Entry, GrepResult, HitBox, ImagePreviewMode, ImageRenderState, PreviewData,
-        SortMode,
+        CommandMode, ContextAction, ContextMenu, Entry, GrepResult, HitBox, ImagePreviewMode,
+        ImageRenderState, PreviewData, SortMode,
     },
     preview::{
         DEFAULT_PREVIEW_IMAGE_DIMENSION, Highlighter, PreparedImage, build_preview, is_image_path,
@@ -146,6 +146,7 @@ pub struct App {
     pub grep_viewing: bool,
     pub highlighter: Highlighter,
     pub pending_open: Option<PendingOpen>,
+    pub context_menu: Option<ContextMenu>,
 }
 
 impl App {
@@ -224,6 +225,7 @@ impl App {
             grep_viewing: false,
             highlighter: Highlighter::new(),
             pending_open: None,
+            context_menu: None,
         };
 
         app.reload_entries()?;
@@ -1521,7 +1523,166 @@ impl App {
         self.status = String::from("Canceled");
     }
 
+    pub fn open_context_menu(&mut self, x: u16, y: u16) {
+        // Don't open context menu during input modes
+        if self.command_mode != CommandMode::Normal {
+            return;
+        }
+        let clicked_idx = self.click_index(x, y);
+
+        let (target_path, actions) = if let Some(idx) = clicked_idx {
+            // Right-clicked on an entry
+            self.set_selected(idx);
+            let entry = &self.entries[self.filtered_indices[idx]];
+            let actions = vec![
+                ContextAction::Open,
+                ContextAction::OpenEditor,
+                ContextAction::Rename,
+                ContextAction::Copy,
+                ContextAction::Move,
+                ContextAction::Delete,
+                ContextAction::CopyPath,
+                ContextAction::NewFile,
+                ContextAction::NewDir,
+                ContextAction::ToggleHidden,
+                ContextAction::SortMode,
+            ];
+            (Some(entry.path.clone()), actions)
+        } else {
+            // Right-clicked on empty area
+            let actions = vec![
+                ContextAction::NewFile,
+                ContextAction::NewDir,
+                ContextAction::ToggleHidden,
+                ContextAction::SortMode,
+                ContextAction::CopyPath,
+            ];
+            (None, actions)
+        };
+
+        self.context_menu = Some(ContextMenu {
+            actions,
+            selected: 0,
+            x,
+            y,
+            target_path,
+        });
+    }
+
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    pub fn context_menu_select_next(&mut self) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            if !menu.actions.is_empty() {
+                menu.selected = (menu.selected + 1) % menu.actions.len();
+            }
+        }
+    }
+
+    pub fn context_menu_select_prev(&mut self) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            if !menu.actions.is_empty() {
+                menu.selected = menu.selected.checked_sub(1).unwrap_or(menu.actions.len() - 1);
+            }
+        }
+    }
+
+    pub fn execute_context_action(&mut self) -> Result<()> {
+        let Some(menu) = self.context_menu.take() else {
+            return Ok(());
+        };
+        let Some(action) = menu.actions.get(menu.selected).copied() else {
+            return Ok(());
+        };
+
+        match action {
+            ContextAction::Open => {
+                if menu.target_path.is_some() {
+                    self.open_selected()?;
+                }
+            }
+            ContextAction::OpenEditor => {
+                self.queue_open_selected()?;
+            }
+            ContextAction::Rename => {
+                self.begin_mode(CommandMode::Rename, self.selected_name());
+            }
+            ContextAction::Copy => {
+                self.begin_mode(CommandMode::Copy, self.selected_name());
+            }
+            ContextAction::Move => {
+                self.begin_mode(CommandMode::Move, self.selected_name());
+            }
+            ContextAction::Delete => {
+                self.command_mode = CommandMode::DeleteConfirm;
+            }
+            ContextAction::NewFile => {
+                self.begin_mode(CommandMode::NewFile, String::new());
+            }
+            ContextAction::NewDir => {
+                self.begin_mode(CommandMode::NewDir, String::new());
+            }
+            ContextAction::ToggleHidden => {
+                self.toggle_hidden()?;
+            }
+            ContextAction::SortMode => {
+                self.toggle_sort()?;
+            }
+            ContextAction::CopyPath => {
+                if let Some(path) = self.selected_path() {
+                    let path_str = path.to_string_lossy().to_string();
+                    // Copy to clipboard via pbcopy (macOS) or xclip (Linux)
+                    #[cfg(target_os = "macos")]
+                    {
+                        use std::io::Write;
+                        use std::process::Stdio;
+                        if let Ok(mut child) = Command::new("pbcopy")
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(ref mut stdin) = child.stdin {
+                                let _ = stdin.write_all(path_str.as_bytes());
+                            }
+                            let _ = child.wait();
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::io::Write;
+                        use std::process::Stdio;
+                        if let Ok(mut child) = Command::new("xclip")
+                            .args(["-selection", "clipboard"])
+                            .stdin(Stdio::piped())
+                            .spawn()
+                        {
+                            if let Some(ref mut stdin) = child.stdin {
+                                let _ = stdin.write_all(path_str.as_bytes());
+                            }
+                            let _ = child.wait();
+                        }
+                    }
+                    self.status = format!("Copied path: {}", path.display());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
+        // Context menu takes priority when open
+        if self.context_menu.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close_context_menu(),
+                KeyCode::Down | KeyCode::Char('j') => self.context_menu_select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.context_menu_select_prev(),
+                KeyCode::Enter => self.execute_context_action()?,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Down | KeyCode::Char('j') => {
@@ -1771,6 +1932,10 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::ScrollDown => {
+                if self.context_menu.is_some() {
+                    self.context_menu_select_next();
+                    return Ok(());
+                }
                 if contains(self.preview_area, x, y) {
                     self.preview_scroll_down();
                 } else {
@@ -1778,13 +1943,48 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => {
+                if self.context_menu.is_some() {
+                    self.context_menu_select_prev();
+                    return Ok(());
+                }
                 if contains(self.preview_area, x, y) {
                     self.preview_scroll_up();
                 } else {
                     self.select_prev();
                 }
             }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.open_context_menu(x, y);
+            }
             MouseEventKind::Down(MouseButton::Left) => {
+                // If context menu is open, click outside closes it
+                if let Some(ref menu) = self.context_menu {
+                    let raw = context_menu_rect(menu);
+                    // Clamp to a reasonable screen area for hit testing
+                    let menu_h = menu.actions.len() as u16 + 2;
+                    let clamped = Rect::new(
+                        raw.x.min(200),
+                        raw.y.min(60),
+                        raw.width,
+                        menu_h.min(60),
+                    );
+                    if !contains(clamped, x, y) {
+                        self.close_context_menu();
+                        return Ok(());
+                    }
+                    // Click inside menu: select the item
+                    let menu_inner_y = clamped.y + 1; // skip border
+                    if y >= menu_inner_y {
+                        let idx = (y - menu_inner_y) as usize;
+                        if idx < menu.actions.len() {
+                            if let Some(m) = self.context_menu.as_mut() {
+                                m.selected = idx;
+                            }
+                            self.execute_context_action()?;
+                        }
+                    }
+                    return Ok(());
+                }
                 if let Some(target) = self.clicked_breadcrumb(x, y) {
                     self.go_to(target)?;
                     self.last_click = Some((x, y, Instant::now()));
@@ -1927,6 +2127,12 @@ pub fn contains(rect: Rect, x: u16, y: u16) -> bool {
         && x < rect.x.saturating_add(rect.width)
         && y >= rect.y
         && y < rect.y.saturating_add(rect.height)
+}
+
+pub fn context_menu_rect(menu: &ContextMenu) -> Rect {
+    let width = 22u16;
+    let height = menu.actions.len() as u16 + 2; // +2 for border
+    Rect::new(menu.x, menu.y, width, height)
 }
 
 pub fn breadcrumb_segments(path: &Path) -> Vec<(String, PathBuf)> {
