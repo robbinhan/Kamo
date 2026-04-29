@@ -79,6 +79,21 @@ fn shell_quote(path: &std::path::Path) -> String {
     format!("'{}'", raw.replace('\'', "'\\''"))
 }
 
+fn build_editor_command(editor: &str, path: &std::path::Path, line_number: Option<u64>) -> String {
+    let path_str = shell_quote(path);
+    match line_number {
+        Some(line) => {
+            // nvim, vim, nano support +LINE; hx uses file:LINE
+            let editor_base = editor.split_whitespace().next().unwrap_or(editor);
+            match editor_base {
+                "hx" | "helix" => format!("{editor} {path_str}:{line}"),
+                _ => format!("{editor} +{line} {path_str}"),
+            }
+        }
+        None => format!("{editor} {path_str}"),
+    }
+}
+
 fn run_pending_open(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
@@ -103,6 +118,8 @@ fn run_pending_open(
             Ok(success)
         }
         OpenTarget::TerminalEditor { editor, detached } => {
+            let cmd = build_editor_command(editor, &pending.path, pending.line_number);
+
             if *detached {
                 let cwd = pending
                     .path
@@ -111,11 +128,7 @@ fn run_pending_open(
                 let status = Command::new("wezterm")
                     .args(["cli", "spawn", "--cwd"])
                     .arg(cwd)
-                    .args([
-                        "sh",
-                        "-lc",
-                        &format!("{} {}", editor, shell_quote(&pending.path)),
-                    ])
+                    .args(["sh", "-lc", &cmd])
                     .status();
                 let success = status.is_ok_and(|status| status.success());
                 app.native_needs_full_clear = true;
@@ -133,7 +146,7 @@ fn run_pending_open(
             terminal.show_cursor()?;
 
             let launch_result = Command::new("sh")
-                .args(["-lc", &format!("{} {}", editor, shell_quote(&pending.path))])
+                .args(["-lc", &cmd])
                 .status();
 
             enable_raw_mode()?;
@@ -158,6 +171,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
     loop {
         needs_draw |= app.pump_image_load_responses();
         needs_draw |= app.pump_resize_responses();
+        needs_draw |= app.pump_grep_results();
         needs_draw |= app.ensure_image_ready()?;
 
         if needs_draw {

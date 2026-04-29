@@ -10,6 +10,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.29"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 ratatui = "0.30"
 ratatui-image = { version = "10", default-features = false, features = ["crossterm", "image-defaults"] }
 unicode-width = "0.2"

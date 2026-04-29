@@ -81,6 +81,11 @@ pub fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
     app.list_area = area;
     let rows = area.height.saturating_sub(2) as usize;
 
+    if app.grep_viewing {
+        draw_grep_list(app, f, area, rows);
+        return;
+    }
+
     let items = app
         .filtered_indices
         .iter()
@@ -139,8 +144,119 @@ pub fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+fn draw_grep_list(app: &mut App, f: &mut Frame, area: Rect, rows: usize) {
+    let items = app
+        .grep_results
+        .iter()
+        .skip(app.list_offset)
+        .take(rows)
+        .map(|result| {
+            let file_name = result
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let line_preview: String = result
+                .line_content
+                .chars()
+                .take(40)
+                .collect::<String>()
+                .replace('\t', " ")
+                .replace('\n', "");
+            let text = format!(
+                "{:<20} L{:<6} {}",
+                truncate_for_preview(&file_name, 20),
+                result.line_number,
+                line_preview
+            );
+            ListItem::new(Line::from(text)).style(Style::default().fg(Color::White))
+        })
+        .collect::<Vec<_>>();
+
+    let title = format!("Grep Results ({})", app.grep_results.len());
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        )
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(
+            Style::default()
+                .bg(Color::Red)
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut state = ListState::default();
+    if !app.grep_results.is_empty() {
+        let relative_selected = app.selected.saturating_sub(app.list_offset);
+        if relative_selected < rows {
+            state.select(Some(relative_selected));
+        }
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 pub fn draw_preview(app: &mut App, f: &mut Frame, area: Rect) {
     app.preview_area = area;
+
+    // Show grep result context when in grep view
+    if app.grep_viewing {
+        let block = Block::default().borders(Borders::ALL).title("Match Context");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if let Some(result) = app.grep_results.get(app.selected) {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "File: ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(result.path.display().to_string()),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Line: ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(result.line_number.to_string()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Content:",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ];
+
+            // Show surrounding context lines
+            for line in result.line_content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(Color::White),
+                )));
+            }
+
+            let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+            f.render_widget(Clear, inner);
+            f.render_widget(paragraph, inner);
+        } else {
+            let msg = Paragraph::new("Select a result to view context")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(msg, inner);
+        }
+        return;
+    }
 
     let is_image_selected = app
         .selected_entry()
@@ -203,19 +319,32 @@ pub fn draw_preview(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-pub fn draw_help(f: &mut Frame, area: Rect) {
-    let help = Line::from(vec![
-        Span::raw("q quit  "),
-        Span::raw("/ search  "),
-        Span::raw("s sort  "),
-        Span::raw("R rename  "),
-        Span::raw("d delete  "),
-        Span::raw("n file  N dir  "),
-        Span::raw("c copy  m move  "),
-        Span::raw("i image/info  "),
-        Span::raw("o open/edit  "),
-        Span::raw("p protocol"),
-    ]);
+pub fn draw_help(app: &App, f: &mut Frame, area: Rect) {
+    let help = if app.grep_viewing {
+        Line::from(vec![
+            Span::styled(
+                "GREP VIEW",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  j/k nav  Enter jump  Esc exit"),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("q quit  "),
+            Span::raw("/ search  "),
+            Span::raw("g goto  "),
+            Span::raw("G grep  "),
+            Span::raw("- back  "),
+            Span::raw("_ fwd  "),
+            Span::raw("s sort  "),
+            Span::raw("R rename  "),
+            Span::raw("d delete  "),
+            Span::raw("n/N file/dir  "),
+            Span::raw("c/m copy/move"),
+        ])
+    };
 
     let p = Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(p, area);
@@ -239,6 +368,34 @@ pub fn draw_command_bar(app: &App, f: &mut Frame, area: Rect) {
             ),
             Span::raw("  Confirm in popup: y = yes, n/Esc = cancel"),
         ]),
+        crate::model::CommandMode::GoTo => {
+            let mut spans = vec![
+                Span::styled(
+                    "GOTO",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" > "),
+                Span::raw(app.input_buffer.clone()),
+            ];
+            // Show inline ghost completion (like fish shell autosuggestion)
+            if let Some(ghost) = app.goto_completions.first() {
+                let input = app.input_buffer.trim();
+                if !input.is_empty() && ghost.len() > input.len() {
+                    let suffix = &ghost[input.len()..];
+                    spans.push(Span::styled(
+                        suffix,
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+            spans.push(Span::styled(
+                "  [Tab] complete",
+                Style::default().fg(Color::DarkGray),
+            ));
+            Line::from(spans)
+        }
         _ => Line::from(vec![
             Span::styled(
                 app.command_mode.prompt(),
@@ -256,7 +413,25 @@ pub fn draw_command_bar(app: &App, f: &mut Frame, area: Rect) {
 }
 
 pub fn draw_status(app: &App, f: &mut Frame, area: Rect) {
-    let p = Paragraph::new(app.status.as_str()).style(Style::default().fg(Color::DarkGray));
+    let status_text = if app.command_mode == crate::model::CommandMode::GoTo
+        && !app.goto_completions.is_empty()
+    {
+        let max_show = 6;
+        let shown: Vec<&str> = app
+            .goto_completions
+            .iter()
+            .take(max_show)
+            .map(|s| s.as_str())
+            .collect();
+        let mut text = shown.join("  ");
+        if app.goto_completions.len() > max_show {
+            text.push_str(&format!("  +{} more", app.goto_completions.len() - max_show));
+        }
+        text
+    } else {
+        app.status.clone()
+    };
+    let p = Paragraph::new(status_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(p, area);
 }
 
@@ -317,7 +492,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
     draw_list(app, f, body[0]);
     draw_preview(app, f, body[1]);
-    draw_help(f, root[2]);
+    draw_help(app, f, root[2]);
     draw_command_bar(app, f, root[3]);
     draw_status(app, f, root[4]);
     draw_delete_popup(app, f);

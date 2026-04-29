@@ -63,6 +63,8 @@ pub enum CommandMode {
     Copy,
     Move,
     DeleteConfirm,
+    GoTo,
+    Grep,
 }
 
 impl CommandMode {
@@ -76,6 +78,8 @@ impl CommandMode {
             Self::Copy => "COPY TO",
             Self::Move => "MOVE TO",
             Self::DeleteConfirm => "DELETE",
+            Self::GoTo => "GOTO",
+            Self::Grep => "GREP",
         }
     }
 }
@@ -119,3 +123,10 @@ pub struct ImageRenderState {
 
 #[derive(Clone, Debug)]
 pub struct LastClick(pub u16, pub u16, pub Instant);
+
+#[derive(Clone, Debug)]
+pub struct GrepResult {
+    pub path: PathBuf,
+    pub line_number: u64,
+    pub line_content: String,
+}

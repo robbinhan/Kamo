@@ -26,7 +26,8 @@ use ratatui_image::{
 use crate::{
     fs_ops::{copy_path, read_entries, resolve_destination, sort_entries},
     model::{
-        CommandMode, Entry, HitBox, ImagePreviewMode, ImageRenderState, PreviewData, SortMode,
+        CommandMode, Entry, GrepResult, HitBox, ImagePreviewMode, ImageRenderState, PreviewData,
+        SortMode,
     },
     preview::{
         DEFAULT_PREVIEW_IMAGE_DIMENSION, Highlighter, PreparedImage, build_preview, is_image_path,
@@ -79,6 +80,7 @@ pub enum OpenTarget {
 pub struct PendingOpen {
     pub path: PathBuf,
     pub target: OpenTarget,
+    pub line_number: Option<u64>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -131,6 +133,17 @@ pub struct App {
     pub command_mode: CommandMode,
     pub input_buffer: String,
     pub search_query: String,
+    pub dir_history: Vec<PathBuf>,
+    pub dir_history_idx: usize,
+    pub goto_completions: Vec<String>,
+    pub goto_completion_idx: usize,
+    pub grep_results: Vec<GrepResult>,
+    pub grep_result_rx: Receiver<GrepResult>,
+    pub grep_result_tx: Sender<GrepResult>,
+    pub grep_done_rx: Receiver<bool>,
+    pub grep_done_tx: Sender<bool>,
+    pub grep_active: bool,
+    pub grep_viewing: bool,
     pub highlighter: Highlighter,
     pub pending_open: Option<PendingOpen>,
 }
@@ -153,6 +166,9 @@ impl App {
         )
         .then(|| probe_wezterm_cell_size(&cwd))
         .flatten();
+        let (grep_result_tx, grep_result_rx) = std::sync::mpsc::channel();
+        let (grep_done_tx, grep_done_rx) = std::sync::mpsc::channel();
+
         let mut app = Self {
             cwd,
             entries: Vec::new(),
@@ -195,6 +211,17 @@ impl App {
             command_mode: CommandMode::Normal,
             input_buffer: String::new(),
             search_query: String::new(),
+            dir_history: Vec::new(),
+            dir_history_idx: 0,
+            goto_completions: Vec::new(),
+            goto_completion_idx: 0,
+            grep_results: Vec::new(),
+            grep_result_rx,
+            grep_result_tx,
+            grep_done_rx,
+            grep_done_tx,
+            grep_active: false,
+            grep_viewing: false,
             highlighter: Highlighter::new(),
             pending_open: None,
         };
@@ -640,6 +667,20 @@ impl App {
         }
     }
 
+    pub fn half_page_down(&mut self) {
+        let step = self.visible_rows().max(1) / 2;
+        if !self.filtered_indices.is_empty() {
+            self.set_selected(min(self.selected + step, self.filtered_indices.len() - 1));
+        }
+    }
+
+    pub fn half_page_up(&mut self) {
+        let step = self.visible_rows().max(1) / 2;
+        if !self.filtered_indices.is_empty() {
+            self.set_selected(self.selected.saturating_sub(step));
+        }
+    }
+
     pub fn open_selected(&mut self) -> Result<()> {
         let Some(entry) = self.selected_entry() else {
             return Ok(());
@@ -650,10 +691,12 @@ impl App {
         let name = entry.name.clone();
 
         if is_dir {
+            self.push_history();
             self.cwd = path;
             self.selected = 0;
             self.list_offset = 0;
             self.search_query.clear();
+            self.grep_viewing = false;
             self.reload_entries()?;
         } else {
             self.status = format!("Opened preview for {name}");
@@ -923,7 +966,7 @@ impl App {
                 format!("Opening in default app: {}", path.display())
             }
         };
-        self.pending_open = Some(PendingOpen { path, target });
+        self.pending_open = Some(PendingOpen { path, target, line_number: None });
         Ok(())
     }
 
@@ -932,25 +975,26 @@ impl App {
     }
 
     pub fn set_open_result(&mut self, pending: &PendingOpen, success: bool) {
+        let path_display = match pending.line_number {
+            Some(line) => format!("{}:{}", pending.path.display(), line),
+            None => pending.path.display().to_string(),
+        };
         self.status = match (&pending.target, success) {
             (OpenTarget::TerminalEditor { editor, detached }, true) => {
                 if *detached {
-                    format!(
-                        "Opened in new editor tab: {editor} | {}",
-                        pending.path.display()
-                    )
+                    format!("Opened in new editor tab: {editor} | {path_display}")
                 } else {
-                    format!("Returned from {editor}: {}", pending.path.display())
+                    format!("Returned from {editor}: {path_display}")
                 }
             }
             (OpenTarget::TerminalEditor { editor, .. }, false) => {
-                format!("Failed to launch {editor}: {}", pending.path.display())
+                format!("Failed to launch {editor}: {path_display}")
             }
             (OpenTarget::SystemDefault, true) => {
-                format!("Opened in default app: {}", pending.path.display())
+                format!("Opened in default app: {path_display}")
             }
             (OpenTarget::SystemDefault, false) => {
-                format!("Failed to open in default app: {}", pending.path.display())
+                format!("Failed to open in default app: {path_display}")
             }
         };
     }
@@ -978,25 +1022,311 @@ impl App {
         };
     }
 
+    pub fn push_history(&mut self) {
+        // Truncate forward history when navigating to a new place
+        self.dir_history.truncate(self.dir_history_idx);
+        // Avoid duplicate consecutive entries
+        if self.dir_history.last() != Some(&self.cwd) {
+            self.dir_history.push(self.cwd.clone());
+        }
+        self.dir_history_idx = self.dir_history.len();
+    }
+
     pub fn go_parent(&mut self) -> Result<()> {
-        if let Some(parent) = self.cwd.parent() {
-            self.cwd = parent.to_path_buf();
+        if let Some(parent) = self.cwd.parent().map(|p| p.to_path_buf()) {
+            self.push_history();
+            self.cwd = parent;
             self.selected = 0;
             self.list_offset = 0;
             self.search_query.clear();
+            self.grep_viewing = false;
             self.reload_entries()?;
         }
         Ok(())
     }
 
     pub fn go_to(&mut self, path: PathBuf) -> Result<()> {
+        self.push_history();
+        self.cwd = path;
+        self.selected = 0;
+        self.list_offset = 0;
+        self.search_query.clear();
+        self.grep_viewing = false;
+        self.reload_entries()?;
+        Ok(())
+    }
+
+    pub fn go_back(&mut self) -> Result<()> {
+        if self.dir_history_idx == 0 {
+            self.status = String::from("No earlier directory");
+            return Ok(());
+        }
+        self.dir_history_idx -= 1;
+        let path = self.dir_history[self.dir_history_idx].clone();
         self.cwd = path;
         self.selected = 0;
         self.list_offset = 0;
         self.search_query.clear();
         self.reload_entries()?;
+        self.status = format!("Back: {}", self.cwd.display());
         Ok(())
     }
+
+    pub fn go_forward(&mut self) -> Result<()> {
+        if self.dir_history_idx + 1 >= self.dir_history.len() {
+            self.status = String::from("No later directory");
+            return Ok(());
+        }
+        self.dir_history_idx += 1;
+        let path = self.dir_history[self.dir_history_idx].clone();
+        self.cwd = path;
+        self.selected = 0;
+        self.list_offset = 0;
+        self.search_query.clear();
+        self.reload_entries()?;
+        self.status = format!("Forward: {}", self.cwd.display());
+        Ok(())
+    }
+
+    pub fn go_to_path_input(&mut self, input: &str) -> Result<()> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            bail!("path is empty");
+        }
+
+        let path = if trimmed.starts_with('~') {
+            if let Some(home) = dirs_home() {
+                home.join(trimmed.strip_prefix("~/").unwrap_or(trimmed.strip_prefix('~').unwrap_or(trimmed)))
+            } else {
+                PathBuf::from(trimmed)
+            }
+        } else if trimmed.starts_with('/') || (trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':') {
+            PathBuf::from(trimmed)
+        } else {
+            self.cwd.join(trimmed)
+        };
+
+        let canonical = fs::canonicalize(&path).or_else(|_| {
+            if trimmed.starts_with('~') {
+                Ok(path.clone())
+            } else {
+                Err(anyhow::anyhow!("path not found: {}", path.display()))
+            }
+        })?;
+
+        if !canonical.is_dir() {
+            bail!("not a directory: {}", canonical.display());
+        }
+
+        self.go_to(canonical)
+    }
+
+    pub fn resolve_goto_base(&self, input: &str) -> (PathBuf, String) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return (self.cwd.clone(), String::new());
+        }
+
+        // Expand ~
+        let expanded = if trimmed.starts_with('~') {
+            if let Some(home) = dirs_home() {
+                home.join(trimmed.strip_prefix("~/").unwrap_or(trimmed.strip_prefix('~').unwrap_or(trimmed)))
+            } else {
+                PathBuf::from(trimmed)
+            }
+        } else {
+            PathBuf::from(trimmed)
+        };
+
+        if trimmed.ends_with('/') || trimmed.ends_with('~') {
+            // User typed a trailing slash — complete from that directory
+            let dir = if trimmed.starts_with('/') || (trimmed.len() >= 2 && trimmed.as_bytes()[1] == b':') {
+                expanded.clone()
+            } else if trimmed.starts_with('~') {
+                expanded.clone()
+            } else {
+                self.cwd.join(&expanded)
+            };
+            return (dir, String::new());
+        }
+
+        // Split into parent directory + partial name
+        match expanded.parent() {
+            Some(parent) if parent != expanded => {
+                let prefix = expanded
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let dir = if expanded.is_absolute() {
+                    parent.to_path_buf()
+                } else {
+                    self.cwd.join(parent)
+                };
+                (dir, prefix)
+            }
+            _ => (self.cwd.clone(), trimmed.to_string()),
+        }
+    }
+
+    pub fn compute_goto_completions(&mut self) {
+        let input = self.input_buffer.clone();
+        let (dir, prefix) = self.resolve_goto_base(&input);
+        let prefix_lower = prefix.to_lowercase();
+
+        self.goto_completions.clear();
+        self.goto_completion_idx = 0;
+
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let use_tilde = input.starts_with('~');
+        let home = dirs_home();
+
+        let mut dirs: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let file_type = entry.file_type().ok();
+            if !file_type.map_or(false, |ft| ft.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue; // skip hidden dirs in completion
+            }
+            if !prefix.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
+                continue;
+            }
+            // Build the full path string for the completion
+            let full_path = dir.join(&name);
+            let display = if use_tilde {
+                if let Some(ref home) = home {
+                    if let Ok(rel) = full_path.strip_prefix(home) {
+                        format!("~/{}", rel.display())
+                    } else {
+                        full_path.to_string_lossy().to_string()
+                    }
+                } else {
+                    full_path.to_string_lossy().to_string()
+                }
+            } else if full_path.is_absolute() {
+                full_path.to_string_lossy().to_string()
+            } else {
+                // Relative path: reconstruct from input prefix
+                let parent_part = input.trim_end_matches(|c: char| c != '/');
+                format!("{parent_part}{name}")
+            };
+            dirs.push(display);
+        }
+
+        dirs.sort();
+        self.goto_completions = dirs;
+    }
+
+    pub fn goto_tab_complete(&mut self) {
+        if self.goto_completions.is_empty() {
+            self.compute_goto_completions();
+            if self.goto_completions.is_empty() {
+                return;
+            }
+        }
+
+        let completion = self.goto_completions[self.goto_completion_idx].clone();
+        self.input_buffer = format!("{completion}/");
+        self.goto_completion_idx = (self.goto_completion_idx + 1) % self.goto_completions.len();
+    }
+
+    pub fn start_grep(&mut self, query: String) {
+        self.grep_results.clear();
+        self.grep_active = true;
+        self.status = format!("Grepping: {query}");
+
+        let dir = self.cwd.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        self.grep_result_tx = result_tx;
+        self.grep_result_rx = result_rx;
+        self.grep_done_tx = done_tx;
+        self.grep_done_rx = done_rx;
+
+        let tx = self.grep_result_tx.clone();
+        let done_tx = self.grep_done_tx.clone();
+
+        std::thread::spawn(move || {
+            run_grep_search(&dir, &query, tx);
+            let _ = done_tx.send(true);
+        });
+    }
+
+    pub fn pump_grep_results(&mut self) -> bool {
+        if !self.grep_active {
+            return false;
+        }
+
+        let mut changed = false;
+        while let Ok(result) = self.grep_result_rx.try_recv() {
+            self.grep_results.push(result);
+            changed = true;
+        }
+
+        if changed && self.command_mode == CommandMode::Grep {
+            let count = self.grep_results.len();
+            self.status = format!("Grepping... {} matches found", count);
+        }
+
+        // Check if search is done
+        if self.grep_done_rx.try_recv().is_ok() {
+            self.grep_active = false;
+            let count = self.grep_results.len();
+            self.status = format!("Grep complete: {} matches", count);
+            changed = true;
+        }
+
+        changed
+    }
+
+    pub fn goto_grep_result(&mut self) -> Result<()> {
+        let Some(result) = self.grep_results.get(self.selected).cloned() else {
+            return Ok(());
+        };
+
+        // Open the file in editor at the matching line
+        let path = result.path.clone();
+        let line = result.line_number;
+
+        let target = if prefers_system_open(&path) {
+            OpenTarget::SystemDefault
+        } else if let Some(editor) = preferred_terminal_editor() {
+            OpenTarget::TerminalEditor {
+                editor: editor.to_string(),
+                detached: can_spawn_editor_tab(),
+            }
+        } else {
+            OpenTarget::SystemDefault
+        };
+
+        self.status = format!(
+            "Opening {}:{} in editor | {}",
+            path.display(),
+            line,
+            result.line_content.trim()
+        );
+
+        self.grep_viewing = false;
+        self.command_mode = CommandMode::Normal;
+        self.input_buffer.clear();
+
+        self.pending_open = Some(PendingOpen {
+            path,
+            target,
+            line_number: Some(line),
+        });
+        Ok(())
+    }
+
+
+
 
     pub fn toggle_hidden(&mut self) -> Result<()> {
         self.show_hidden = !self.show_hidden;
@@ -1140,6 +1470,24 @@ impl App {
                 self.reload_entries()?;
                 self.status = format!("Moved to {}", dst.display());
             }
+            CommandMode::GoTo => {
+                let input = self.input_buffer.clone();
+                self.command_mode = CommandMode::Normal;
+                self.input_buffer.clear();
+                self.go_to_path_input(&input)?;
+            }
+            CommandMode::Grep => {
+                let query = self.input_buffer.trim().to_string();
+                if query.is_empty() {
+                    bail!("search query is empty");
+                }
+                self.command_mode = CommandMode::Normal;
+                self.input_buffer.clear();
+                self.grep_viewing = true;
+                self.selected = 0;
+                self.list_offset = 0;
+                self.start_grep(query);
+            }
         }
         Ok(())
     }
@@ -1176,17 +1524,85 @@ impl App {
     pub fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
-            KeyCode::Up | KeyCode::Char('k') => self.select_prev(),
-            KeyCode::PageDown => self.page_down(),
-            KeyCode::PageUp => self.page_up(),
-            KeyCode::Home => self.set_selected(0),
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.grep_viewing {
+                    if self.selected + 1 < self.grep_results.len() {
+                        self.selected += 1;
+                        self.ensure_visible();
+                    }
+                } else {
+                    self.select_next();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.grep_viewing {
+                    self.selected = self.selected.saturating_sub(1);
+                    self.ensure_visible();
+                } else {
+                    self.select_prev();
+                }
+            }
+            KeyCode::PageDown => {
+                if self.grep_viewing {
+                    let step = self.visible_rows().max(1);
+                    self.selected = (self.selected + step).min(self.grep_results.len().saturating_sub(1));
+                    self.ensure_visible();
+                } else {
+                    self.page_down();
+                }
+            }
+            KeyCode::PageUp => {
+                if self.grep_viewing {
+                    let step = self.visible_rows().max(1);
+                    self.selected = self.selected.saturating_sub(step);
+                    self.ensure_visible();
+                } else {
+                    self.page_up();
+                }
+            }
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                if self.grep_viewing {
+                    let step = self.visible_rows().max(1) / 2;
+                    self.selected = (self.selected + step).min(self.grep_results.len().saturating_sub(1));
+                    self.ensure_visible();
+                } else {
+                    self.half_page_down();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                if self.grep_viewing {
+                    let step = self.visible_rows().max(1) / 2;
+                    self.selected = self.selected.saturating_sub(step);
+                    self.ensure_visible();
+                } else {
+                    self.half_page_up();
+                }
+            }
+            KeyCode::Home => {
+                if self.grep_viewing {
+                    self.selected = 0;
+                    self.list_offset = 0;
+                } else {
+                    self.set_selected(0);
+                }
+            }
             KeyCode::End => {
-                if !self.filtered_indices.is_empty() {
+                if self.grep_viewing {
+                    if !self.grep_results.is_empty() {
+                        self.selected = self.grep_results.len() - 1;
+                        self.ensure_visible();
+                    }
+                } else if !self.filtered_indices.is_empty() {
                     self.set_selected(self.filtered_indices.len() - 1)
                 }
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected()?,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if self.grep_viewing {
+                    self.goto_grep_result()?;
+                } else {
+                    self.open_selected()?;
+                }
+            }
             KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => self.go_parent()?,
             KeyCode::Char('.') => self.toggle_hidden()?,
             KeyCode::Char('r') => self.reload_entries()?,
@@ -1205,6 +1621,20 @@ impl App {
             KeyCode::Char('K') => self.preview_scroll_up(),
             KeyCode::Char('F') => self.preview_page_down(),
             KeyCode::Char('B') => self.preview_page_up(),
+            KeyCode::Char('-') => self.go_back()?,
+            KeyCode::Char('_') => self.go_forward()?,
+            KeyCode::Char('g') => self.begin_mode(CommandMode::GoTo, String::new()),
+            KeyCode::Char('G') => self.begin_mode(CommandMode::Grep, String::new()),
+            KeyCode::Char('0') => self.go_to(self.cwd.clone())?, // noop refresh
+            KeyCode::Esc => {
+                if self.grep_viewing {
+                    self.grep_viewing = false;
+                    self.grep_results.clear();
+                    self.selected = 0;
+                    self.list_offset = 0;
+                    self.status = String::from("Exited grep view");
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -1215,6 +1645,45 @@ impl App {
             CommandMode::DeleteConfirm => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => self.cancel_command(),
                 KeyCode::Char('y') => self.delete_selected()?,
+                _ => {}
+            },
+            CommandMode::GoTo => match key.code {
+                KeyCode::Esc => self.cancel_command(),
+                KeyCode::Enter => self.commit_command()?,
+                KeyCode::Backspace => {
+                    self.input_buffer.pop();
+                    self.goto_completions.clear();
+                    self.goto_completion_idx = 0;
+                }
+                KeyCode::Tab => {
+                    self.goto_tab_complete();
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty()
+                        || key.modifiers == KeyModifiers::SHIFT
+                        || key.modifiers == KeyModifiers::ALT =>
+                {
+                    self.input_buffer.push(c);
+                    self.goto_completions.clear();
+                    self.goto_completion_idx = 0;
+                }
+                _ => {}
+            },
+            CommandMode::Grep => match key.code {
+                KeyCode::Esc => {
+                    self.command_mode = CommandMode::Normal;
+                    self.input_buffer.clear();
+                    self.status = String::from("Grep canceled");
+                }
+                KeyCode::Enter => self.commit_command()?,
+                KeyCode::Backspace => {
+                    self.input_buffer.pop();
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.input_buffer.push(c);
+                }
                 _ => {}
             },
             CommandMode::Search
@@ -1492,4 +1961,111 @@ pub fn breadcrumb_segments(path: &Path) -> Vec<(String, PathBuf)> {
     }
 
     out
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+const GREP_MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
+fn escape_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if r"\.+*?^${}()|[]".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn run_grep_search(root: &Path, query: &str, tx: Sender<GrepResult>) {
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::Searcher;
+
+    let escaped = escape_regex(query);
+    let pattern = format!("(?i){escaped}");
+
+    let matcher = match RegexMatcherBuilder::new()
+        .case_insensitive(true)
+        .build(&pattern)
+    {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let mut searcher = Searcher::new();
+    walk_dir_for_grep(root, &matcher, &mut searcher, &tx);
+}
+
+fn walk_dir_for_grep(
+    dir: &Path,
+    matcher: &grep_regex::RegexMatcher,
+    searcher: &mut grep_searcher::Searcher,
+    tx: &Sender<GrepResult>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.')
+                || name_str == "node_modules"
+                || name_str == "target"
+                || name_str == ".git"
+            {
+                continue;
+            }
+            walk_dir_for_grep(&path, matcher, searcher, tx);
+        } else if file_type.is_file() {
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() > GREP_MAX_FILE_SIZE {
+                continue;
+            }
+
+            let path_clone = path.clone();
+            let tx_clone = tx.clone();
+            let mut count = 0usize;
+
+            // Use search_path which handles file opening and mmap internally
+            let result = searcher.search_path(
+                matcher,
+                &path,
+                grep_searcher::sinks::UTF8(|line_number: u64, line_content: &str| {
+                    if count >= 200 {
+                        return Ok(false);
+                    }
+                    let result = GrepResult {
+                        path: path_clone.clone(),
+                        line_number,
+                        line_content: line_content.to_string(),
+                    };
+                    let _ = tx_clone.send(result);
+                    count += 1;
+                    Ok(true)
+                }),
+            );
+
+            // Silently skip binary files or encoding errors
+            let _ = result;
+        }
+    }
 }
