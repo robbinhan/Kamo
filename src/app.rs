@@ -30,7 +30,8 @@ use crate::{
         ImageRenderState, PreviewData, SortMode,
     },
     preview::{
-        DEFAULT_PREVIEW_IMAGE_DIMENSION, Highlighter, PreparedImage, build_preview, is_image_path,
+        DEFAULT_PREVIEW_IMAGE_DIMENSION, Highlighter, PreparedImage, build_preview, is_html_path,
+        is_image_path, is_visual_preview,
     },
     preview_backend::{
         NativePreviewBackend, NativePreviewController, NativeRenderFit, NativeRenderSpec,
@@ -395,7 +396,7 @@ impl App {
 
         let entry_path = entry.path.clone();
 
-        if !is_image_path(&entry_path) || self.image_mode != ImagePreviewMode::Image {
+        if !is_visual_preview(&entry_path) || self.image_mode != ImagePreviewMode::Image {
             let changed =
                 self.image_state.is_some() || self.image_path.is_some() || self.image_loading;
             self.image_state = None;
@@ -945,7 +946,16 @@ impl App {
             return Ok(());
         };
 
-        let target = if prefers_system_open(&path) {
+        let target = if is_html_path(&path) && awrit_available() {
+            // HTML files: prefer awrit for interactive terminal browsing
+            // Serve via temporary HTTP server since Electron custom sessions block file://
+            let url = serve_html_via_http(&path);
+            let quoted = shell_quote_str(&url);
+            OpenTarget::TerminalEditor {
+                editor: format!("awrit {quoted}"),
+                detached: can_spawn_editor_tab(),
+            }
+        } else if prefers_system_open(&path) {
             OpenTarget::SystemDefault
         } else if let Some(editor) = preferred_terminal_editor() {
             OpenTarget::TerminalEditor {
@@ -1342,14 +1352,14 @@ impl App {
 
     pub fn toggle_image_mode(&mut self) {
         if let Some(entry) = self.selected_entry() {
-            if is_image_path(&entry.path) {
+            if is_visual_preview(&entry.path) {
                 self.image_mode = self.image_mode.toggle();
                 self.mark_image_dirty(false);
                 self.refresh_preview();
                 return;
             }
         }
-        self.status = String::from("Selected file is not an image");
+        self.status = String::from("Selected file has no visual preview");
     }
 
     pub fn preview_scroll_down(&mut self) {
@@ -2029,6 +2039,73 @@ impl App {
         }
         Ok(())
     }
+}
+
+fn shell_quote_str(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Start a temporary HTTP server to serve a local HTML file.
+/// Returns the URL to access it. The server auto-terminates after ~300s.
+fn url_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Start a temporary HTTP server to serve a local HTML file.
+/// Returns the URL to access it. The server auto-terminates after ~300s.
+fn serve_html_via_http(path: &Path) -> String {
+    use std::net::TcpListener;
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.port())
+        .unwrap_or(8765);
+
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let _ = Command::new("sh")
+        .args([
+            "-lc",
+            &format!(
+                "exec python3 -m http.server {} --directory '{}' --bind 127.0.0.1 2>/dev/null",
+                port,
+                dir.display(),
+            ),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    let encoded = url_encode_path(&file_name);
+    format!("http://127.0.0.1:{port}/{encoded}")
+}
+
+fn awrit_available() -> bool {
+    Command::new("awrit")
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn prefers_system_open(path: &Path) -> bool {

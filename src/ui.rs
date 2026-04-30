@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{App, breadcrumb_segments, context_menu_rect},
     model::ContextAction,
-    preview::{is_image_path, truncate_for_preview},
+    preview::{is_visual_preview, truncate_for_preview},
 };
 
 // ── Color palette ───────────────────────────────────────────────
@@ -208,7 +208,7 @@ pub fn draw_list(app: &mut App, f: &mut Frame, area: Rect) {
                     Style::default().fg(CLR_DIR).add_modifier(Modifier::BOLD),
                     CLR_DIR,
                 )
-            } else if is_image_path(&entry.path) {
+            } else if is_visual_preview(&entry.path) {
                 (Style::default().fg(CLR_IMAGE), CLR_IMAGE)
             } else {
                 (Style::default().fg(CLR_FILE), CLR_SUBTEXT)
@@ -411,7 +411,7 @@ pub fn draw_preview(app: &mut App, f: &mut Frame, area: Rect) {
 
     let is_image_selected = app
         .selected_entry()
-        .map(|e| is_image_path(&e.path))
+        .map(|e| is_visual_preview(&e.path))
         .unwrap_or(false);
 
     if is_image_selected

@@ -80,6 +80,10 @@ fn shell_quote(path: &std::path::Path) -> String {
 }
 
 fn build_editor_command(editor: &str, path: &std::path::Path, line_number: Option<u64>) -> String {
+    // If editor string already contains a URL (e.g. awrit with file://), use it as-is
+    if editor.contains("://") {
+        return editor.to_string();
+    }
     let path_str = shell_quote(path);
     match line_number {
         Some(line) => {
